@@ -1,0 +1,111 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Find and unzip BidaAimTrainer-source.zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP="$(find . -name 'BidaAimTrainer-source.zip' -not -path './_src/*' | head -n 1)"
+          if [ -z "$ZIP" ]; then echo "::error::BidaAimTrainer-source.zip not found in the repository"; exit 1; fi
+          echo "Found ZIP: $ZIP"
+          rm -rf _src && mkdir _src
+          unzip -q "$ZIP" -d _src
+          SETTINGS="$(find _src -maxdepth 4 -name settings.gradle | head -n 1)"
+          if [ -z "$SETTINGS" ]; then echo "::error::settings.gradle not found inside the ZIP"; exit 1; fi
+          PROJECT_DIR="$GITHUB_WORKSPACE/$(dirname "$SETTINGS")"
+          echo "Project dir: $PROJECT_DIR"
+          ls "$PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # No third-party SDK action: the ubuntu runner image already ships the Android SDK.
+      # This step only locates it, installs platform 34 / build-tools 34.0.0 if missing, and exports ANDROID_HOME.
+      - name: Prepare Android SDK (preinstalled on the runner)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          if [ ! -d "$SDK" ]; then echo "::error::Android SDK directory not found: $SDK"; exit 1; fi
+          echo "Using Android SDK at: $SDK"
+          SDKMANAGER="$(ls "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -n 1 || true)"
+          if [ -z "$SDKMANAGER" ]; then SDKMANAGER="$(command -v sdkmanager || true)"; fi
+          NEED=0
+          [ -d "$SDK/platforms/android-34" ] || NEED=1
+          [ -d "$SDK/build-tools/34.0.0" ] || NEED=1
+          if [ "$NEED" = 1 ]; then
+            if [ -z "$SDKMANAGER" ]; then echo "::error::platform 34 / build-tools 34.0.0 missing and sdkmanager not found"; exit 1; fi
+            echo "Installing platform 34 + build-tools 34.0.0 with $SDKMANAGER"
+            set +o pipefail
+            yes | "$SDKMANAGER" --sdk_root="$SDK" --licenses > /dev/null 2>&1 || true
+            yes | sudo "$SDKMANAGER" --sdk_root="$SDK" --licenses > /dev/null 2>&1 || true
+            "$SDKMANAGER" --sdk_root="$SDK" "platforms;android-34" "build-tools;34.0.0" \
+              || sudo "$SDKMANAGER" --sdk_root="$SDK" "platforms;android-34" "build-tools;34.0.0"
+            set -o pipefail
+          fi
+          [ -d "$SDK/platforms/android-34" ] || { echo "::error::platforms/android-34 still missing"; exit 1; }
+          [ -d "$SDK/build-tools/34.0.0" ] || { echo "::error::build-tools/34.0.0 still missing"; exit 1; }
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          ls "$SDK/platforms" "$SDK/build-tools"
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      # Tests are reported but do not block the APK (remove 'continue-on-error' to make them blocking).
+      - name: Run engine + trainer tests
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle -p "$PROJECT_DIR" :engine:engineTests --no-daemon --console=plain --stacktrace 2>&1 | tee "$GITHUB_WORKSPACE/test.log"
+
+      - name: Build debug APK (:app:assembleDebug)
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle -p "$PROJECT_DIR" :app:assembleDebug --no-daemon --console=plain --stacktrace 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Locate APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$(find "$PROJECT_DIR/app/build/outputs/apk/debug" -name '*.apk' | head -n 1)"
+          if [ -z "$APK" ]; then echo "::error::no APK produced"; exit 1; fi
+          ls -la "$APK"
+          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
+
+      - name: Upload APK (build succeeded)
+        uses: actions/upload-artifact@v4
+        with:
+          name: BidaAimTrainer-debug-apk
+          path: ${{ env.APK_PATH }}
+          if-no-files-found: error
+
+      # Runs even when a step above failed, so the log is always available.
+      - name: Upload build.log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: |
+            build.log
+            test.log
+          if-no-files-found: ignore
